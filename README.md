@@ -49,18 +49,7 @@ before enabling third-party mods.
 
 ## Latest validated target
 
-| Component | Validated value |
-|---|---|
-| Game | Palworld Dedicated Server |
-| Game version | 1.0.2.100993 |
-| Steam build ID | 24445026 |
-| Unreal Engine | 5.1.1 |
-| Architecture | x86-64 |
-| Distribution | Fedora Linux 43 |
-| Loading method | Process-lifetime `LD_PRELOAD` through the process-scoped launcher |
-| PalServer SHA-256 | `f1d8ced330d8933bf077040dbf62c11f9ebf79d299369d16ba736ea36afda01b` |
-| PalServer ELF build ID | `12db0eec6678474d` |
-| Imported Linux baseline | `407d14cf3c485a150cd157fd581643c901dd9b0e` |
+Pavlov VR Dedicated Server: UE 5.1.1 (UPDATE: 1.0.29)
 
 See the complete [Linux compatibility matrix](docs/linux/COMPATIBILITY.md).
 The original `linux-v0.1.1` release acceptance used Palworld `1.0.2.100933`.
