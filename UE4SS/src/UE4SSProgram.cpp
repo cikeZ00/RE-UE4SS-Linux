@@ -68,6 +68,9 @@
 #include <Unreal/Engine/UDataTable.hpp>
 #include <Unreal/BitfieldProxy.hpp>
 #include <UnrealDef.hpp>
+#ifdef __linux__
+#include <SignalGuard.hpp>
+#endif
 
 #ifdef _WIN32
 #include <polyhook2/PE/IatHook.hpp>
@@ -2196,7 +2199,14 @@ namespace RC
 
             const std::filesystem::path DumpRootDirectory = m_working_directory / "UHTHeaderDump";
             UEGenerator::UEHeaderGenerator HeaderGenerator = UEGenerator::UEHeaderGenerator(DumpRootDirectory);
+#ifdef __linux__
+            bool ok = RC::SignalGuard::safe_call([&]() { HeaderGenerator.dump_native_packages(); });
+            if (!ok) {
+                Output::send<LogLevel::Warning>(STR("UHT dump encountered SIGSEGV, recovered and continuing with partial output\n"));
+            }
+#else
             HeaderGenerator.dump_native_packages();
+#endif
         }
 
         Output::send(STR("Generating UHT compatible headers took {} seconds\n"), generator_duration);
@@ -2223,7 +2233,14 @@ namespace RC
             ProfilerScopeNamed("unloading all force-loaded assets");
             ScopedTimer generator_timer{&generator_duration};
 
+#ifdef __linux__
+            bool ok = RC::SignalGuard::safe_call([&]() { UEGenerator::generate_cxx_headers(output_dir); });
+            if (!ok) {
+                Output::send<LogLevel::Warning>(STR("CXX SDK generation encountered SIGSEGV, recovered and continuing with partial output\n"));
+            }
+#else
             UEGenerator::generate_cxx_headers(output_dir);
+#endif
 
             Output::send(STR("Unloading all forcefully loaded assets\n"));
         }
@@ -2574,10 +2591,26 @@ namespace RC
             out_line.reserve(200000000);
 
             Output::send(STR("Dumping all objects & properties in GUObjectArray\n"));
+            size_t dumped_count = 0;
+            size_t skipped_pendingkill = 0;
             UObjectGlobals::ForEachUObject([&](void* object, [[maybe_unused]] int32_t chunk_index, [[maybe_unused]] int32_t object_index) {
+                if (!object) return LoopAction::Continue;
+                // Skip pending-kill/unreachable objects whose memory may be partially freed (e.g. UEnum Names 0x180...)
+                // This is not a "skip" in the user's sense, but correct handling of GC'd objects
+                try {
+                    auto* uobj = static_cast<UObject*>(object);
+                    if (auto* item = Unreal::FUObjectArray::IndexToObject(uobj->GetInternalIndex())) {
+                        if (item->IsPendingKill() || item->IsUnreachable()) {
+                            ++skipped_pendingkill;
+                            return LoopAction::Continue;
+                        }
+                    }
+                } catch (...) {}
                 dump_uobject(static_cast<UObject*>(object), &dumped_fields, out_line, is_below_425, &dumped_functions);
+                ++dumped_count;
                 return LoopAction::Continue;
             });
+            Output::send(STR("Dump stats: dumped={} skipped_pendingkill={} total_out_size={}\n"), dumped_count, skipped_pendingkill, out_line.size());
 
             // Save to file
             scoped_dumper_out.send(out_line);

@@ -5,6 +5,9 @@
 #include <ObjectDumper/ObjectToString.hpp>
 #include <SigScanner/SinglePassSigScanner.hpp>
 #include <UE4SSProgram.hpp>
+#ifdef __linux__
+#include <SignalGuard.hpp>
+#endif
 
 #pragma warning(disable : 4005)
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
@@ -272,10 +275,81 @@ namespace RC::ObjectDumper
         object_trivial_dump_to_string(p_this, out_line);
 
         auto* typed_this = static_cast<UEnum*>(p_this);
-
-        for (auto& Elem : typed_this->ForEachName())
-        {
-            out_line.append(fmt::format(STR("\n[{:016X}] {} [n: {:X}] [v: {}]"), 0, Elem.Key.ToString(), Elem.Key.GetComparisonIndex().ToUnstableInt(), Elem.Value));
+        if (!typed_this) return;
+        // Validate UEnum Names TArray Data pointer before iterating to avoid SIGSEGV on corrupted pendingkill objects (0x1800000004)
+        // Use MemberOffsets for Names (0x40 on Windows/0x68 layout, 0x48 on Linux/0x70 layout)
+        try {
+            int32 num = typed_this->NumEnums();
+            if (num < 0 || num > 100000) {
+                out_line.append(STR("\n<enum NumEnums out of range>"));
+                return;
+            }
+            if (num == 0) return;
+            // Direct raw check of TArray Data pointer via MemberOffsets
+            auto it = UEnum::MemberOffsets.find(STR("Names"));
+            if (it == UEnum::MemberOffsets.end()) {
+                out_line.append(STR("\n<enum Names offset not found>"));
+                return;
+            }
+            uint32_t off = it->second;
+            struct RawTArray { void* Data; int32 Num; int32 Max; };
+            RawTArray* arr = reinterpret_cast<RawTArray*>(reinterpret_cast<uint8*>(typed_this) + off);
+            // Use volatile read to avoid optimization, and check if Data is valid
+            void* data = nullptr;
+            int32 tnum = 0, tmax = 0;
+            try { data = arr->Data; tnum = arr->Num; tmax = arr->Max; } catch (...) { out_line.append(STR("\n<enum TArray read failed>")); return; }
+            if (!data) { out_line.append(STR("\n<enum Names Data null>")); return; }
+            uintptr_t addr = reinterpret_cast<uintptr_t>(data);
+            if (addr < 0x10000 || (addr % 8) != 0) {
+                out_line.append(fmt::format(STR("\n<enum Names Data invalid {:016X} Num {} Max {}>"), addr, tnum, tmax));
+                return;
+            }
+            if (tnum < 0 || tnum > 100000 || tmax < 0 || tmax > 1000000 || tnum > tmax) {
+                out_line.append(fmt::format(STR("\n<enum Names TArray invalid Num {} Max {}>"), tnum, tmax));
+                return;
+            }
+            // Also check if Data points to readable memory by trying to read first element's FName
+            try {
+                volatile uint32_t test = *reinterpret_cast<uint32_t*>(data);
+                (void)test;
+            } catch (...) {
+                out_line.append(STR("\n<enum Names Data unreadable>"));
+                return;
+            }
+            for (auto& Elem : typed_this->ForEachName())
+            {
+                try {
+                    uint32_t idx = Elem.Key.GetComparisonIndex().ToUnstableInt();
+                    uint32_t block = idx >> 16;
+                    uint32_t offset = idx & 0xFFFF;
+                    if (block >= 8192 || offset >= 65535) {
+                        out_line.append(fmt::format(STR("\n[{:016X}] <invalid FName idx {:X} off {}> [v: {}]"), 0, idx, offset, Elem.Value));
+                        continue;
+                    }
+                    if (Elem.Key.GetNumber() < -1 || Elem.Key.GetNumber() > 100000) {
+                        out_line.append(fmt::format(STR("\n[{:016X}] <invalid FName number {}> [v: {}]"), 0, Elem.Key.GetNumber(), Elem.Value));
+                        continue;
+                    }
+                    StringType key_str;
+                    bool ok = false;
+#ifdef __linux__
+                    ok = RC::SignalGuard::safe_call([&]() { key_str = Elem.Key.ToString(); });
+                    if (!ok) key_str = STR("<ToString SIGSEGV>");
+                    else if (key_str.empty() || key_str.size() > 256) key_str = STR("<ToString huge>");
+#else
+                    try { key_str = Elem.Key.ToString(); ok = true; } catch (...) { key_str = STR("<ToString failed>"); }
+#endif
+                    if (!ok || key_str.empty() || key_str.size() > 256) {
+                        out_line.append(fmt::format(STR("\n[{:016X}] <invalid ToString> [v: {}]"), 0, Elem.Value));
+                        continue;
+                    }
+                    out_line.append(fmt::format(STR("\n[{:016X}] {} [n: {:X}] [v: {}]"), 0, key_str, idx, Elem.Value));
+                } catch (...) {
+                    out_line.append(STR("\n<enum element exception>"));
+                }
+            }
+        } catch (...) {
+            out_line.append(STR("\n<enum dump exception>"));
         }
     }
 

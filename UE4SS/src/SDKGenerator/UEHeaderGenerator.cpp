@@ -894,11 +894,25 @@ namespace RC::UEGenerator
         implementation_file.m_implementation_constructor.append(fmt::format(STR("{}::{}() {{"), struct_native_name, struct_native_name));
         implementation_file.begin_indent_level();
 
-        // Generate properties
-        void* struct_default_object = malloc(script_struct->GetPropertiesSize());
+        // Generate properties - validate size before malloc
+        int32 struct_size = 0;
+        try { struct_size = script_struct->GetPropertiesSize(); } catch (...) { struct_size = 0; }
+        if (struct_size < 0 || struct_size > 0x100000) {
+            Output::send<LogLevel::Warning>(STR("Skipping struct {} with suspicious size {}\n"), struct_native_name, struct_size);
+            implementation_file.end_indent_level();
+            implementation_file.append_line(STR("}"));
+            return;
+        }
+        void* struct_default_object = malloc(struct_size);
+        if (!struct_default_object) {
+            Output::send<LogLevel::Warning>(STR("malloc failed for struct {} size {}\n"), struct_native_name, struct_size);
+            implementation_file.end_indent_level();
+            implementation_file.append_line(STR("}"));
+            return;
+        }
 
         // TODO: ScriptStruct->InitializeStruct(StructDefaultObject);
-        memset(struct_default_object, 0, script_struct->GetPropertiesSize());
+        memset(struct_default_object, 0, struct_size);
 
         for (FProperty* property : TReverseFieldRange<FProperty>(script_struct, EFieldIterationFlags::IncludeDeprecated))
         {
@@ -1138,9 +1152,16 @@ namespace RC::UEGenerator
             super = ustruct->GetSuperStruct();
             if (super != nullptr)
             {
-                super_object = malloc(super->GetPropertiesSize());
-                memset(super_object, 0, super->GetPropertiesSize());
-                super_property = super->GetPropertyByNameInChain(FromCharTypePtr<Unreal::TCHAR>(property_name.data()));
+                int32 super_size = 0;
+                try { super_size = super->GetPropertiesSize(); } catch (...) { super_size = 0; }
+                if (super_size < 0 || super_size > 0x100000) super_size = 0;
+                if (super_size > 0) {
+                    super_object = malloc(super_size);
+                    if (super_object) {
+                        memset(super_object, 0, super_size);
+                        try { super_property = super->GetPropertyByNameInChain(FromCharTypePtr<Unreal::TCHAR>(property_name.data())); } catch (...) { super_property = nullptr; }
+                    }
+                }
             }
         }
 
@@ -3846,78 +3867,114 @@ namespace RC::UEGenerator
         std::vector<UFunction*> native_delegates_to_dump;
 
         Output::send(STR("Gathering native objects for dumping\n"));
+        size_t skipped_pendingkill_gather = 0;
         UObjectGlobals::ForEachUObject([&](void* raw_object, int32_t chunk_index, int32_t object_index) {
             UObject* typed_object = static_cast<UObject*>(raw_object);
+            if (!typed_object) return RC::LoopAction::Continue;
+            // Skip pendingkill/unreachable objects whose memory may be corrupted
+            try {
+                if (auto* item = Unreal::FUObjectArray::IndexToObject(typed_object->GetInternalIndex())) {
+                    if (item->IsPendingKill() || item->IsUnreachable()) {
+                        ++skipped_pendingkill_gather;
+                        return RC::LoopAction::Continue;
+                    }
+                }
+            } catch (...) { ++skipped_pendingkill_gather; return RC::LoopAction::Continue; }
+            // Additional sanity: skip objects with null ClassPrivate
+            try {
+                if (!typed_object->GetClassPrivate()) return RC::LoopAction::Continue;
+            } catch (...) { return RC::LoopAction::Continue; }
 
             if (UClass* casted_object = Cast<UClass>(typed_object))
             {
-                if ((casted_object->GetClassFlags() & CLASS_Native) != 0)
-                {
-                    native_classes_to_dump.push_back(casted_object);
-                }
+                try {
+                    if ((casted_object->GetClassFlags() & CLASS_Native) != 0)
+                    {
+                        // Validate ClassFlags not corrupted (huge)
+                        if (casted_object->GetClassFlags() > (0xFFFFFF)) { /* suspicious but still allow */ }
+                        native_classes_to_dump.push_back(casted_object);
+                    }
+                } catch (...) {}
             }
             else if (UScriptStruct* casted_struct = Cast<UScriptStruct>(typed_object))
             {
-                if ((casted_struct->GetStructFlags() & STRUCT_Native) != 0)
-                {
-                    native_structs_to_dump.push_back(casted_struct);
-                }
+                try {
+                    if ((casted_struct->GetStructFlags() & STRUCT_Native) != 0)
+                    {
+                        native_structs_to_dump.push_back(casted_struct);
+                    }
+                } catch (...) {}
             }
             else if (UEnum* uenum = Cast<UEnum>(typed_object))
             {
-                if (!typed_object->IsA<UUserDefinedEnum>())
-                {
-                    native_enums_to_dump.push_back(uenum);
-                }
+                try {
+                    if (!typed_object->IsA<UUserDefinedEnum>())
+                    {
+                        // Validate UEnum Names before including - NumEnums will return 0 for corrupted
+                        if (uenum->NumEnums() >= 0 && uenum->NumEnums() <= 100000)
+                            native_enums_to_dump.push_back(uenum);
+                    }
+                } catch (...) {}
             }
             else if (UFunction* function = Cast<UFunction>(typed_object))
             {
-                // We are looking for delegate signature functions located inside the native packages
-                // When they are located directly on the top level, they will result in a separate header, otherwise they will
-                // be included into their respective outer header
-                if (is_delegate_signature_function(function) && function->GetOuterPrivate()->IsA<UPackage>())
-                {
-                    UPackage* outer_package = Cast<UPackage>(function->GetOuterPrivate());
-
-                    // Make sure the function package actually corresponds to the real native module
-                    if (!get_module_name_for_package(outer_package).empty())
+                try {
+                    // We are looking for delegate signature functions located inside the native packages
+                    // When they are located directly on the top level, they will result in a separate header, otherwise they will
+                    // be included into their respective outer header
+                    if (is_delegate_signature_function(function) && function->GetOuterPrivate() && function->GetOuterPrivate()->IsA<UPackage>())
                     {
-                        native_delegates_to_dump.push_back(function);
+                        UPackage* outer_package = Cast<UPackage>(function->GetOuterPrivate());
+
+                        // Make sure the function package actually corresponds to the real native module
+                        if (outer_package && !get_module_name_for_package(outer_package).empty())
+                        {
+                            native_delegates_to_dump.push_back(function);
+                        }
                     }
-                }
+                } catch (...) {}
             }
 
             return RC::LoopAction::Continue;
         });
+        if (skipped_pendingkill_gather) Output::send(STR("Skipped {} pendingkill objects during gather\n"), skipped_pendingkill_gather);
 
         Output::send(STR("Attempting to dump {} native classes\n"), native_classes_to_dump.size());
 
+        size_t failed_delegates = 0, failed_classes = 0, failed_structs = 0, failed_enums = 0;
         for (UFunction* delegate_signature_function : native_delegates_to_dump)
         {
-            // Output::send(STR("Dumping native delegate type {}\n"), global_delegate_signature->GetName());
-            generate_object_description_file(delegate_signature_function);
+            try { if (!generate_object_description_file(delegate_signature_function)) {} } 
+            catch (std::exception& e) { Output::send<LogLevel::Warning>(STR("Failed to dump delegate {}: {}\n"), delegate_signature_function ? delegate_signature_function->GetName() : STR("<null>"), ensure_str(e.what())); ++failed_delegates; }
+            catch (...) { Output::send<LogLevel::Warning>(STR("Failed to dump delegate (unknown)\n")); ++failed_delegates; }
         }
 
         for (UClass* class_to_dump : native_classes_to_dump)
         {
-            // Output::send(STR("Dumping native class {}\n"), class_to_dump->GetName());
-            generate_object_description_file(class_to_dump);
+            try { if (!generate_object_description_file(class_to_dump)) {} } 
+            catch (std::exception& e) { Output::send<LogLevel::Warning>(STR("Failed to dump class {}: {}\n"), class_to_dump ? class_to_dump->GetName() : STR("<null>"), ensure_str(e.what())); ++failed_classes; }
+            catch (...) { Output::send<LogLevel::Warning>(STR("Failed to dump class (unknown exception) {}\n"), class_to_dump ? fmt::format(STR("{:016X}"), reinterpret_cast<uintptr_t>(class_to_dump)) : STR("<null>")); ++failed_classes; }
         }
 
         Output::send(STR("Attempting to dump {} native structs\n"), native_structs_to_dump.size());
 
         for (UScriptStruct* struct_to_dump : native_structs_to_dump)
         {
-            // Output::send(STR("Dumping native struct {}\n"), struct_to_dump->GetName());
-            generate_object_description_file(struct_to_dump);
+            try { if (!generate_object_description_file(struct_to_dump)) {} } 
+            catch (std::exception& e) { Output::send<LogLevel::Warning>(STR("Failed to dump struct {}: {}\n"), struct_to_dump ? struct_to_dump->GetName() : STR("<null>"), ensure_str(e.what())); ++failed_structs; }
+            catch (...) { Output::send<LogLevel::Warning>(STR("Failed to dump struct (unknown)\n")); ++failed_structs; }
         }
 
         Output::send(STR("Attempting to dump {} native enums\n"), native_enums_to_dump.size());
 
         for (UEnum* enum_to_dump : native_enums_to_dump)
         {
-            // Output::send(STR("Dumping native enum {}\n"), enum_to_dump->GetName());
-            generate_object_description_file(enum_to_dump);
+            try { if (!generate_object_description_file(enum_to_dump)) {} } 
+            catch (std::exception& e) { Output::send<LogLevel::Warning>(STR("Failed to dump enum {}: {}\n"), enum_to_dump ? enum_to_dump->GetName() : STR("<null>"), ensure_str(e.what())); ++failed_enums; }
+            catch (...) { Output::send<LogLevel::Warning>(STR("Failed to dump enum (unknown) {}\n"), enum_to_dump ? fmt::format(STR("{:016X}"), reinterpret_cast<uintptr_t>(enum_to_dump)) : STR("<null>")); ++failed_enums; }
+        }
+        if (failed_classes || failed_structs || failed_enums || failed_delegates) {
+            Output::send(STR("UHT dump warnings: failed delegates={} classes={} structs={} enums={}\n"), failed_delegates, failed_classes, failed_structs, failed_enums);
         }
 
         Output::send(STR("Writing stub module build files for {} modules\n"), m_module_dependencies.size());
@@ -3978,8 +4035,27 @@ namespace RC::UEGenerator
 
     auto UEHeaderGenerator::generate_object_description_file(UObject* object) -> bool
     {
-        const StringType module_name = get_module_name_for_package(object->GetOutermost());
-        const StringType file_base_name = get_header_name_for_object(object);
+        if (!object) return false;
+        // Validate object is not pendingkill/corrupted before any GetOuter etc.
+        try {
+            if (auto* item = Unreal::FUObjectArray::IndexToObject(object->GetInternalIndex())) {
+                if (item->IsPendingKill() || item->IsUnreachable()) return false;
+            }
+        } catch (...) { return false; }
+        StringType module_name;
+        StringType file_base_name;
+        try {
+            UObject* outermost = object->GetOutermost();
+            if (!outermost) return false;
+            module_name = get_module_name_for_package(outermost);
+            file_base_name = get_header_name_for_object(object);
+        } catch (std::exception& e) {
+            Output::send<LogLevel::Warning>(STR("generate_object_description_file: failed to get module/name for {:016X}: {}\n"), reinterpret_cast<uintptr_t>(object), ensure_str(e.what()));
+            return false;
+        } catch (...) {
+            Output::send<LogLevel::Warning>(STR("generate_object_description_file: unknown exception for {:016X}\n"), reinterpret_cast<uintptr_t>(object));
+            return false;
+        }
 
         if (module_name.empty())
         {

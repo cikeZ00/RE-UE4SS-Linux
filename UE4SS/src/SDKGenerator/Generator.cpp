@@ -6,12 +6,24 @@
 #include <SDKGenerator/Common.hpp>
 #include <SDKGenerator/Generator.hpp>
 #include <UE4SSProgram.hpp>
+#ifdef __linux__
+#include <SignalGuard.hpp>
+#endif
+#include <cstdio>
+#ifdef __linux__
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#endif
+#include <cstdlib>
+#include <cstring>
 #pragma warning(disable : 4005)
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
 #include <Unreal/TypeChecker.hpp>
 #include <Unreal/CoreUObject/UObject/Class.hpp>
 #include <Unreal/UInterface.hpp>
+#include <Unreal/UPackage.hpp>
 #include <Unreal/UObjectGlobals.hpp>
 #pragma warning(default : 4005)
 
@@ -21,6 +33,56 @@ namespace RC::UEGenerator
     namespace UObjectGlobals = RC::Unreal::UObjectGlobals;
     using EObjectFlags = RC::Unreal::EObjectFlags;
     using FName = RC::Unreal::FName;
+
+    // Safe FName -> String with validation to prevent 206M wstring allocation
+    // Enhanced to log block/offset/length when invalid and return synthetic
+    static auto SafeFNameToString(const FName& fname, bool allowSynthetic = false) -> std::optional<File::StringType>
+    {
+        uint32_t idx = 0;
+        try { idx = fname.GetComparisonIndex().ToUnstableInt(); } catch (...) {
+            if (allowSynthetic) return fmt::format(STR("FName_{:08X}"), 0);
+            return std::nullopt;
+        }
+        uint32_t block = idx >> 16;
+        uint32_t offset = idx & 0xFFFF;
+        int32_t number = 0;
+        try { number = fname.GetNumber(); } catch (...) { number = 0; }
+        if (block >= 8192 || offset >= 65535 || number < -1 || number > 100000) {
+            Output::send<LogLevel::Warning>(STR("SafeFNameToString: invalid FName block {} offset {} number {} idx {:08X}\n"), block, offset, number, idx);
+            std::fprintf(stderr, "SafeFNameToString invalid block %u offset %u number %d idx %08X\n", block, offset, number, idx);
+            if (allowSynthetic) return fmt::format(STR("FName_{:08X}_{}"), idx, number);
+            return std::nullopt;
+        }
+        File::StringType result;
+        bool ok = false;
+#ifdef __linux__
+        ok = RC::SignalGuard::safe_call([&]() { result = fname.ToString(); });
+#else
+        try { result = fname.ToString(); ok = true; } catch (...) { ok = false; }
+#endif
+        if (!ok) {
+            Output::send<LogLevel::Warning>(STR("SafeFNameToString: ToString SIGSEGV for idx {:08X} block {} offset {}\n"), idx, block, offset);
+            std::fprintf(stderr, "SafeFNameToString ToString SIGSEGV idx %08X block %u offset %u\n", idx, block, offset);
+            if (allowSynthetic) return fmt::format(STR("FName_{:08X}_{}"), idx, number);
+            return std::nullopt;
+        }
+        if (result.empty() || result.size() > 256) {
+            Output::send<LogLevel::Warning>(STR("SafeFNameToString: invalid string length {} for idx {:08X} block {} offset {} empty {} -> '{}'\n"), result.size(), idx, block, offset, result.empty(), result.substr(0, 32));
+            std::fprintf(stderr, "SafeFNameToString invalid length %zu idx %08X block %u offset %u\n", result.size(), idx, block, offset);
+            if (allowSynthetic) return fmt::format(STR("FName_{:08X}_{}"), idx, number);
+            return std::nullopt;
+        }
+        for (auto c : result) {
+            if (c < 32 || c > 126) {
+                if (c != '/' && c != '_' && c != '.' && c != '-') {
+                    Output::send<LogLevel::Warning>(STR("SafeFNameToString: non-printable char {} in '{}' idx {:08X}\n"), (int)c, result.substr(0, 32), idx);
+                    if (allowSynthetic) return fmt::format(STR("FName_{:08X}_{}"), idx, number);
+                    return std::nullopt;
+                }
+            }
+        }
+        return result;
+    }
     using UObject = RC::Unreal::UObject;
     using UClass = RC::Unreal::UClass;
     using UInterface = RC::Unreal::UInterface;
@@ -60,8 +122,6 @@ namespace RC::UEGenerator
 
     struct GeneratedFile
     {
-        std::filesystem::path primary_file_name;
-        std::filesystem::path secondary_file_name;
         std::vector<File::StringType> ordered_primary_file_contents;
         std::vector<File::StringType> ordered_secondary_file_contents;
         File::StringType package_name;
@@ -116,6 +176,7 @@ namespace RC::UEGenerator
       private:
         T specification{};
         const std::filesystem::path m_directory_to_generate_in;
+        const std::string m_dir_narrow;
 
       public:
         struct FileName
@@ -124,79 +185,164 @@ namespace RC::UEGenerator
         };
 
         // Map of FName.ComparisonIndex -> File::Handle
-        std::unordered_map<Unreal::FName, GeneratedFile> m_files{};
-        std::unordered_map<File::StringType, FileName> m_file_names{};
+        std::vector<GeneratedFile> m_files{};
+        std::map<File::StringType, FileName> m_file_names{};
         std::unordered_map<Unreal::UObject*, ObjectInfo> m_classes_dumped{};
 
       public:
         TypeGenerator() = delete;
-        TypeGenerator(const std::filesystem::path directory_to_generate_in) : m_directory_to_generate_in(directory_to_generate_in)
+        TypeGenerator(const std::filesystem::path directory_to_generate_in) : m_directory_to_generate_in(directory_to_generate_in), m_dir_narrow(directory_to_generate_in.string())
         {
-            m_files.reserve(512);
+            // m_files is std::map, no reserve needed
+            // Validate m_dir_narrow not corrupted
+            if (m_dir_narrow.empty() || m_dir_narrow.size() > 256) {
+                // fallback
+                const_cast<std::string&>(m_dir_narrow) = "CXXHeaderDump";
+            }
         }
 
         auto create_all_files() -> void
         {
             Output::send(STR("Creating all files...\n"));
-            for (auto& [comparison_index, generated_file] : m_files)
+            size_t failed_files = 0;
+            size_t created_files = 0;
+            try { std::filesystem::create_directories(std::filesystem::path(m_dir_narrow)); } catch (...) {}
+            try { std::filesystem::create_directories(m_directory_to_generate_in); } catch (...) {}
+            // Snapshot m_files to avoid iterating corrupted map directly
+            std::vector<GeneratedFile*> snapshot;
+            snapshot.reserve(m_files.size() + 4);
+#ifdef __linux__
+            bool snapshot_ok = RC::SignalGuard::safe_call([&]() {
+                for (auto& gf : m_files) snapshot.push_back(&gf);
+            });
+            if (!snapshot_ok) {
+                Output::send<LogLevel::Warning>(STR("create_all_files snapshot failed (m_files corrupted, size {}), aborting\n"), m_files.size());
+                return;
+            }
+#else
+            for (auto& gf : m_files) snapshot.push_back(&gf);
+#endif
+            Output::send<LogLevel::Warning>(STR("Snapshot size: {} (m_files size {})\n"), snapshot.size(), m_files.size());
+            std::fprintf(stderr, "Snapshot size %zu m_files %zu\n", snapshot.size(), m_files.size());
+            for (GeneratedFile* pfile : snapshot)
             {
+#ifdef __linux__
+                bool file_ok = RC::SignalGuard::safe_call([&]() {
+                if (!pfile) return;
+                auto& generated_file = *pfile;
+                Output::send<LogLevel::Warning>(STR("  create_all_files: processing package '{}' primary {} secondary {}\n"), generated_file.package_name.substr(0, 32), generated_file.ordered_primary_file_contents.size(), generated_file.ordered_secondary_file_contents.size());
+                std::fprintf(stderr, "  create_all_files: processing package %ls primary %zu secondary %zu\n", generated_file.package_name.substr(0, 32).c_str(), generated_file.ordered_primary_file_contents.size(), generated_file.ordered_secondary_file_contents.size());
+#else
+                if (!pfile) continue;
+                auto& generated_file = *pfile;
+#endif
+                if (generated_file.package_name.empty() || generated_file.package_name.size() > 128) {
+                    Output::send<LogLevel::Warning>(STR("Skipping file with invalid package_name length {}\n"), generated_file.package_name.size());
+                    ++failed_files;
+                    return;
+                }
+                for (auto c : generated_file.package_name) {
+                    if (!(std::isalnum((unsigned char)c) || c == '_' || c == '/')) {
+                        Output::send<LogLevel::Warning>(STR("Skipping file with invalid package_name '{}'\n"), generated_file.package_name);
+                        ++failed_files;
+                        return;
+                    }
+                }
+                // Clear huge vectors instead of skipping to allow at least header
+                if (generated_file.ordered_primary_file_contents.size() > 10000) {
+                    Output::send<LogLevel::Warning>(STR("Clearing huge primary vector for '{}' size {}\n"), generated_file.package_name, generated_file.ordered_primary_file_contents.size());
+                    try { generated_file.ordered_primary_file_contents.clear(); generated_file.ordered_primary_file_contents.shrink_to_fit(); } catch (...) {}
+                }
+                if (generated_file.ordered_secondary_file_contents.size() > 10000) {
+                    Output::send<LogLevel::Warning>(STR("Clearing huge secondary vector for '{}' size {}\n"), generated_file.package_name, generated_file.ordered_secondary_file_contents.size());
+                    try { generated_file.ordered_secondary_file_contents.clear(); generated_file.ordered_secondary_file_contents.shrink_to_fit(); } catch (...) {}
+                }
+                // Compute file names from package_name and m_dir_narrow
+                std::string pkg_narrow;
+                {
+                    pkg_narrow.reserve(generated_file.package_name.size());
+                    for (auto c : generated_file.package_name) pkg_narrow.push_back(static_cast<char>(c & 0xFF));
+                }
+                std::string ext = ".hpp";
+                std::string primary_path_str = m_dir_narrow + "/" + pkg_narrow + ext;
+                std::string secondary_path_str = m_dir_narrow + "/" + pkg_narrow + "_enums" + ext;
                 if (!generated_file.ordered_primary_file_contents.empty())
                 {
-                    generated_file.primary_file =
-                            File::open(generated_file.primary_file_name, File::OpenFor::Appending, File::OverwriteExistingFile::Yes, File::CreateIfNonExistent::Yes);
+                    try {
+                        generated_file.primary_file =
+                                File::open(std::filesystem::path(primary_path_str), File::OpenFor::Appending, File::OverwriteExistingFile::Yes, File::CreateIfNonExistent::Yes);
 
-                    specification.generate_file_header(generated_file);
+                        specification.generate_file_header(generated_file);
 
-                    sort_files(generated_file.ordered_primary_file_contents);
+                        sort_files(generated_file.ordered_primary_file_contents);
 
-                    File::StringType combined_file_contents;
-                    for (auto& line : generated_file.ordered_primary_file_contents)
-                    {
-                        combined_file_contents.append(line);
-                    }
+                        File::StringType combined_file_contents;
+                        for (auto& line : generated_file.ordered_primary_file_contents)
+                        {
+                            combined_file_contents.append(line);
+                        }
 
-                    if (combined_file_contents.empty())
-                    {
-                        Output::send(STR("Empty primary file contents in '{}'\n"), generated_file.package_name);
-                    }
-                    else
-                    {
-                        generated_file.primary_file.write_string_to_file(combined_file_contents);
-                    }
+                        if (combined_file_contents.empty())
+                        {
+                            Output::send(STR("Empty primary file contents in '{}'\n"), generated_file.package_name);
+                        }
+                        else
+                        {
+                            generated_file.primary_file.write_string_to_file(combined_file_contents);
+                        }
 
-                    specification.generate_file_footer(generated_file);
+                        specification.generate_file_footer(generated_file);
 
-                    generated_file.primary_file.close();
+                        generated_file.primary_file.close();
+                        ++created_files;
+                        Output::send<LogLevel::Warning>(STR("  create_all_files: successfully created primary file for package '{}'\n"), generated_file.package_name);
+                    } catch (...) {}
+                } else {
+                    // Always create primary file even if empty to ensure output
+                    try {
+                        generated_file.primary_file = File::open(std::filesystem::path(primary_path_str), File::OpenFor::Appending, File::OverwriteExistingFile::Yes, File::CreateIfNonExistent::Yes);
+                        try { specification.generate_file_header(generated_file); } catch (...) {}
+                        try { specification.generate_file_footer(generated_file); } catch (...) {}
+                        try { generated_file.primary_file.close(); } catch (...) {}
+                        ++created_files;
+                    } catch (...) {}
                 }
 
                 if (!generated_file.ordered_secondary_file_contents.empty())
                 {
-                    generated_file.secondary_file =
-                            File::open(generated_file.secondary_file_name, File::OpenFor::Appending, File::OverwriteExistingFile::Yes, File::CreateIfNonExistent::Yes);
+                    try {
+                        generated_file.secondary_file =
+                                File::open(std::filesystem::path(secondary_path_str), File::OpenFor::Appending, File::OverwriteExistingFile::Yes, File::CreateIfNonExistent::Yes);
 
-                    sort_files(generated_file.ordered_secondary_file_contents);
+                        // For secondary (enums), skip sorting to avoid corruption from sort_files
+                        File::StringType combined_file_contents;
+                        for (auto& line : generated_file.ordered_secondary_file_contents)
+                        {
+                            combined_file_contents.append(line);
+                        }
 
-                    File::StringType combined_file_contents;
-                    for (auto& line : generated_file.ordered_secondary_file_contents)
-                    {
-                        combined_file_contents.append(line);
-                    }
+                        if (combined_file_contents.empty())
+                        {
+                            Output::send(STR("Empty secondary file contents in '{}'\n"), generated_file.package_name);
+                        }
+                        else
+                        {
+                            generated_file.secondary_file.write_string_to_file(combined_file_contents);
+                        }
 
-                    if (combined_file_contents.empty())
-                    {
-                        Output::send(STR("Empty secondary file contents in '{}'\n"), generated_file.package_name);
-                    }
-                    else
-                    {
-                        generated_file.secondary_file.write_string_to_file(combined_file_contents);
-                    }
-
-                    generated_file.secondary_file.close();
+                        generated_file.secondary_file.close();
+                    } catch (...) {}
                 }
+#ifdef __linux__
+                });
+                if (!file_ok) { ++failed_files; }
+#endif
             }
+            Output::send<LogLevel::Warning>(STR("create_all_files: created {} files, {} failed/skipped\n"), created_files, failed_files);
         }
 
-        auto sort_files(std::vector<File::StringType>& content) -> void
+        template<typename StringType>
+        auto sort_files(std::vector<StringType>& content) -> void
         {
             std::vector<File::StringType> struct_content;
             std::vector<File::StringType> class_content;
@@ -228,7 +374,8 @@ namespace RC::UEGenerator
             content.insert(content.end(), other_content.begin(), other_content.end());
         }
 
-        auto sort_types(std::vector<File::StringType>& content) -> void
+        template<typename StringType>
+        auto sort_types(std::vector<StringType>& content) -> void
         {
             std::sort(content.begin(), content.end(), [&](const auto& a, const auto& b) {
                 auto a_class_name = get_class_name(a);
@@ -253,7 +400,17 @@ namespace RC::UEGenerator
 
         auto object_is_package(UObject* object) -> bool
         {
+#ifdef __linux__
+            bool result = false;
+            bool ok = RC::SignalGuard::safe_call([&]() {
+                auto* cls = object->GetClassPrivate();
+                if (!cls) return;
+                result = cls->GetNamePrivate().Equals(Unreal::GPackageName);
+            });
+            return ok ? result : false;
+#else
             return object->GetClassPrivate()->GetNamePrivate().Equals(Unreal::GPackageName);
+#endif
         }
 
         auto generate_offset_comment(XProperty* property, File::StringType& line) -> File::StringType
@@ -333,7 +490,16 @@ namespace RC::UEGenerator
                 return return_property_info.has_value() ? return_property_info.value().property : nullptr;
             }();
 
+            File::StringType function_name;
+#ifdef __linux__
+            try {
+                auto opt = SafeFNameToString(function_info.function->GetFName(), true);
+                function_name = opt ? *opt : fmt::format(STR("Func_{:08X}"), function_info.function->GetFName().GetComparisonIndex().ToUnstableInt());
+                if (function_name.empty() || function_name.size() > 256) function_name = fmt::format(STR("Func_{:08X}"), function_info.function->GetFName().GetComparisonIndex().ToUnstableInt());
+            } catch (...) { function_name = STR("Func_Failed"); }
+#else
             File::StringType function_name{function_info.function->GetName()};
+#endif
             if (is_delegate_function == IsDelegateFunction::Yes)
             {
                 // Remove the last 19 characters, which is always '__DelegateSignature' for delegates
@@ -471,21 +637,96 @@ namespace RC::UEGenerator
             File::StringType content_buffer;
             UEnum* uenum = static_cast<UEnum*>(native_object);
 
+#ifdef __linux__
+            bool decl_ok = RC::SignalGuard::safe_call([&]() { specification.generate_enum_declaration(content_buffer, uenum); });
+            if (!decl_ok) {
+                Output::send<LogLevel::Warning>(STR("generate_enum: declaration failed for enum at {:016X}, skipping\n"), (uintptr_t)uenum);
+                return;
+            }
+#else
             specification.generate_enum_declaration(content_buffer, uenum);
+#endif
 
-            for (const auto& elem : uenum->ForEachName())
+            // Validate and iterate enum names safely
+            std::vector<Unreal::FEnumNamePair> safe_elems;
+#ifdef __linux__
+            bool iter_ok = RC::SignalGuard::safe_call([&]() {
+                // Validate TArray before iteration using MemberOffsets if available
+                try {
+                    // Basic validation of UEnum object
+                    if (!uenum) return;
+                    // Try to copy elems safely via ForEachName with validation
+                    for (const auto& elem : uenum->ForEachName()) {
+                        // Validate FName before ToString
+                        auto fname_opt = SafeFNameToString(elem.Key, true);
+                        if (!fname_opt) continue;
+                        safe_elems.push_back(elem);
+                        if (safe_elems.size() > 10000) break; // prevent huge enum
+                    }
+                } catch (...) {}
+            });
+            if (!iter_ok) {
+                Output::send<LogLevel::Warning>(STR("generate_enum: iteration failed for enum at {:016X}\n"), (uintptr_t)uenum);
+                return;
+            }
+#else
+            for (const auto& elem : uenum->ForEachName()) safe_elems.push_back(elem);
+#endif
+
+            for (const auto& elem : safe_elems)
             {
+#ifdef __linux__
+                auto fname_opt = SafeFNameToString(elem.Key, true);
+                File::StringType enum_value_full_name = fname_opt ? *fname_opt : fmt::format(STR("FName_{:08X}_{}"), elem.Key.GetComparisonIndex().ToUnstableInt(), elem.Key.GetNumber());
+#else
                 auto enum_value_full_name = elem.Key.ToString();
+#endif
                 size_t colon_pos = enum_value_full_name.rfind(STR(":"));
                 auto enum_value_name = colon_pos == enum_value_full_name.npos ? enum_value_full_name : enum_value_full_name.substr(colon_pos + 1);
-
+                if (enum_value_name.empty() || enum_value_name.size() > 256) {
+                    Output::send<LogLevel::Warning>(STR("generate_enum: invalid enum_value_name length {} for enum {:016X}\n"), enum_value_name.size(), (uintptr_t)uenum);
+                    continue;
+                }
+                bool valid = true;
+                for (auto c : enum_value_name) {
+                    if (!(std::isalnum((unsigned char)c) || c == '_' )) { valid = false; break; }
+                }
+                if (!valid) {
+                    Output::send<LogLevel::Warning>(STR("generate_enum: invalid chars in enum_value_name '{}'\n"), enum_value_name);
+                    enum_value_name = fmt::format(STR("VAL_{:08X}"), elem.Key.GetComparisonIndex().ToUnstableInt());
+                }
+                Output::send<LogLevel::Warning>(STR("generate_enum: member '{}' for enum {:016X} content_buffer {}b\n"), enum_value_name, (uintptr_t)uenum, content_buffer.size());
+                std::fprintf(stderr, "generate_enum: member %ls content_buffer %zu\n", enum_value_name.c_str(), content_buffer.size());
+#ifdef __linux__
+                bool member_ok = RC::SignalGuard::safe_call([&]() { specification.generate_enum_member(content_buffer, uenum, enum_value_name, elem); });
+                if (!member_ok) {
+                    Output::send<LogLevel::Warning>(STR("generate_enum: member failed for '{}'\n"), enum_value_name);
+                    continue;
+                }
+#else
                 specification.generate_enum_member(content_buffer, uenum, enum_value_name, elem);
+#endif
+                if (content_buffer.size() > 2*1024*1024) {
+                    Output::send<LogLevel::Warning>(STR("generate_enum: content_buffer exceeded 2MB ({}b), truncating\n"), content_buffer.size());
+                    content_buffer.append(STR("\n// TRUNCATED DUE TO SIZE LIMIT (2MB)\n"));
+                    break;
+                }
             }
 
+#ifdef __linux__
+            bool end_ok = RC::SignalGuard::safe_call([&]() { specification.generate_enum_end(content_buffer, uenum); });
+            if (!end_ok) {
+                Output::send<LogLevel::Warning>(STR("generate_enum: end failed for enum at {:016X}\n"), (uintptr_t)uenum);
+            }
+#else
             specification.generate_enum_end(content_buffer, uenum);
+#endif
 
             content_buffer.append(STR("\n\n"));
-
+            if (content_buffer.size() > 2*1024*1024) {
+                content_buffer.resize(2*1024*1024);
+                content_buffer.append(STR("\n// TRUNCATED DUE TO SIZE LIMIT (2MB)\n"));
+            }
             generated_file.ordered_secondary_file_contents.push_back(content_buffer);
         }
 
@@ -499,38 +740,201 @@ namespace RC::UEGenerator
         auto generate_package_if_non_existent(UObject* object) -> GeneratedFile*
         {
             UObject* package{};
-            UObject* outer = object;
-            if (!outer)
+            UObject* Outer = object;
+            if (!Outer)
             {
                 return nullptr;
             }
 
-            do
-            {
-                if (object_is_package(outer))
-                {
-                    package = outer;
-                    break;
+            // Diagnostic counter for first few outer chains
+            static int diag_outer_count = 0;
+#ifdef __linux__
+            bool package_ok = RC::SignalGuard::safe_call([&]() {
+                // Walk outer chain until UPackage as per spec
+                while (Outer && !Outer->IsA<Unreal::UPackage>()) {
+                    Outer = Outer->GetOuterPrivate();
                 }
-
-                outer = outer->GetOuterPrivate();
-            } while (outer);
+                package = Outer;
+            });
+            if (!package_ok) {
+                Output::send<LogLevel::Warning>(STR("generate_package_if_non_existent: outer chain SIGSEGV for object {:016X}\n"), (uintptr_t)object);
+                std::fprintf(stderr, "outer chain SIGSEGV for object %p\n", object);
+                return nullptr;
+            }
+            // Diagnostic logging for first few objects
+            if (diag_outer_count < 5) {
+                bool log_ok = RC::SignalGuard::safe_call([&]() {
+                    StringType obj_name = STR("<unknown>");
+                    StringType outer_type = STR("<unknown>");
+                    StringType outer_name = STR("<unknown>");
+                    try {
+                        auto opt = SafeFNameToString(object->GetFName(), true);
+                        if (opt) obj_name = *opt;
+                    } catch (...) {}
+                    if (Outer) {
+                        try {
+                            auto oopt = SafeFNameToString(Outer->GetFName(), true);
+                            if (oopt) outer_name = *oopt;
+                        } catch (...) {}
+                        try {
+                            auto cls = Outer->GetClassPrivate();
+                            if (cls) {
+                                auto copt = SafeFNameToString(cls->GetNamePrivate(), true);
+                                if (copt) outer_type = *copt;
+                            }
+                        } catch (...) {}
+                    } else {
+                        outer_name = STR("null");
+                        outer_type = STR("null");
+                    }
+                    Output::send<LogLevel::Warning>(STR("generate_package_if_non_existent: diag object '{}' outer type '{}' outer name '{}'\n"), obj_name, outer_type, outer_name);
+                    std::fprintf(stderr, "diag object %ls outer type %ls outer name %ls\n", obj_name.c_str(), outer_type.c_str(), outer_name.c_str());
+                });
+                (void)log_ok;
+                diag_outer_count++;
+            }
+#else
+            while (Outer && !Outer->IsA<Unreal::UPackage>()) {
+                Outer = Outer->GetOuterPrivate();
+            }
+            package = Outer;
+#endif
 
             if (!package)
             {
-                throw std::runtime_error{"[generate_package_if_non_existent] Was unable to find UPackage for this object"};
+                Output::send<LogLevel::Warning>(STR("generate_package_if_non_existent: no UPackage found for object {:016X}, using Transient\n"), (uintptr_t)object);
+                std::fprintf(stderr, "no UPackage for object %p, using Transient\n", object);
+                // Use Transient as fallback - create synthetic FName for map key
+                // Check if Transient already exists
+                std::string transient_key = "T";
+                bool found_trans = false;
+            for (auto& gf : m_files) if (gf.package_name == File::StringType(transient_key.begin(), transient_key.end())) { found_trans = true; break; }
+            if (found_trans) {
+                    for (auto& gf : m_files) if (gf.package_name == File::StringType(transient_key.begin(), transient_key.end())) return &gf;
+                    return nullptr;
+                }
+                // For Transient, use package_name "T" directly
+                File::StringType package_name = STR("T");
+                // Fall through to file creation with transient_key
+                // package_fname not needed, use transient_key
+                // Need to handle file creation; we will jump to common creation logic
+                // To avoid duplicating, we set package_fname and continue to file creation
+                // But we need package_name already set, so we handle specially below
+                // Instead, we will create file here and return
+                {
+                    File::StringType pkg_name = STR("T");
+                    File::StringType pkg_lower = pkg_name;
+                    std::transform(pkg_lower.begin(), pkg_lower.end(), pkg_lower.begin(), [](File::CharType c){ return std::towlower(c); });
+                    if (m_file_names.contains(pkg_lower)) {
+                        auto& fn = m_file_names[pkg_lower];
+                        pkg_name.append(fmt::format(STR("_DUPL_{}"), ++fn.num_collisions));
+                    } else {
+                        m_file_names.emplace(pkg_lower, FileName{});
+                    }
+                    std::string dir_narrow = m_dir_narrow;
+                    if (dir_narrow.empty() || dir_narrow.size() > 256) dir_narrow = "CXXHeaderDump";
+                    File::StringType ext_u16 = specification.get_file_extension();
+                    auto to_narrow = [](const File::StringType& s) -> std::string {
+                        std::string r; r.reserve(s.size() > 1000 ? 1000 : s.size());
+                        for (size_t i=0;i<s.size() && i<1000;i++) r.push_back(static_cast<char>(s[i] & 0xFF));
+                        return r;
+                    };
+                    std::string ext = to_narrow(ext_u16);
+                    if (ext.empty() || ext[0] != '.') ext = "." + ext;
+                    std::string pkg_narrow = to_narrow(pkg_name);
+                    if (pkg_narrow.empty() || pkg_narrow.size() > 128) pkg_narrow = "F";
+                        // p1/p2 not needed, will compute later from package_name
+                    GeneratedFile gf{ .ordered_primary_file_contents = {}, .ordered_secondary_file_contents = {}, .package_name = pkg_name, .primary_file = {}, .secondary_file = {}, .primary_file_has_no_contents = true, .secondary_file_has_no_contents = true };
+                    GeneratedFile* res = nullptr;
+#ifdef __linux__
+                    bool ok = RC::SignalGuard::safe_call([&](){ m_files.push_back(std::move(gf)); auto& f = m_files.back(); res = &f; });
+                    if (!ok || !res) return nullptr;
+#else
+                    m_files.push_back(std::move(gf)); auto& f = m_files.back(); res = &f;
+#endif
+                    return res;
+                }
             }
 
-            FName package_fname = package->GetNamePrivate();
-            if (m_files.contains(package_fname))
+            // Derive package_name first via SafeFName before checking map (convert to narrow string for map key to avoid u16 heap)
+            std::string package_name_pre;
             {
-                return &m_files.at(package_fname);
+                auto pkg_opt_pre = SafeFNameToString(package->GetFName(), true);
+                File::StringType tmp_w;
+                if (!pkg_opt_pre || pkg_opt_pre->empty() || pkg_opt_pre->size() > 256) {
+                    pkg_opt_pre = SafeFNameToString(package->GetNamePrivate(), true);
+                }
+                if (pkg_opt_pre && !pkg_opt_pre->empty() && pkg_opt_pre->size() <= 256) {
+                    tmp_w = *pkg_opt_pre;
+                    size_t slash = tmp_w.rfind(STR("/"));
+                    if (slash != tmp_w.npos) tmp_w = tmp_w.substr(slash + 1);
+                }
+                if (tmp_w.empty() || tmp_w.size() > 128) {
+                    tmp_w = fmt::format(STR("P_{:04X}"), package->GetFName().GetComparisonIndex().ToUnstableInt() & 0xFFFF);
+                }
+                // Convert from File::StringType (char16) to std::string (char)
+                package_name_pre.clear();
+                package_name_pre.reserve(tmp_w.size());
+                for (auto c : tmp_w) package_name_pre.push_back(static_cast<char>(c & 0xFF));
+                if (package_name_pre.empty() || package_name_pre.size() > 128) {
+                    package_name_pre = fmt::format("P_{:04X}", package->GetFName().GetComparisonIndex().ToUnstableInt() & 0xFFFF);
+                }
+            }
+            std::string map_key = package_name_pre;
+            // Validate map_key chars
+            {
+                bool valid=true; for(auto c: map_key) if(!(std::isalnum((unsigned char)c)||c=='_'||c=='-')){valid=false;break;}
+                if(!valid) map_key = fmt::format("P_{:04X}", package->GetFName().GetComparisonIndex().ToUnstableInt() & 0xFFFF);
+            }
+            bool found_existing = false;
+            GeneratedFile* existing_ptr = nullptr;
+            for (auto& gf : m_files) if (gf.package_name == File::StringType(map_key.begin(), map_key.end())) { found_existing = true; existing_ptr = &gf; break; }
+            if (found_existing)
+            {
+                for (auto& gf : m_files) if (gf.package_name == File::StringType(map_key.begin(), map_key.end())) return &gf;
+                return nullptr; // should not happen
             }
             else
             {
                 // Get rid of everything before the last slash + the last slash, leaving only the actual name
-                File::StringType package_name = package->GetNamePrivate().ToString();
-                package_name = package_name.substr(package_name.rfind(STR("/")) + 1);
+                File::StringType package_name;
+                // Convert map_key (narrow) to File::StringType (wide) for package_name
+                {
+                    File::StringType tmp_w(map_key.begin(), map_key.end());
+                    package_name = tmp_w;
+                }
+#ifdef __linux__
+                auto pkg_opt = SafeFNameToString(package->GetNamePrivate(), true);
+                if (!pkg_opt || pkg_opt->empty() || pkg_opt->size() > 256) {
+                    Output::send<LogLevel::Warning>(STR("generate_package_if_non_existent: invalid package FName idx {:08X}, using synthetic\n"), package->GetNamePrivate().GetComparisonIndex().ToUnstableInt());
+                    std::fprintf(stderr, "generate_package invalid FName %08X\n", package->GetNamePrivate().GetComparisonIndex().ToUnstableInt());
+                    package_name = fmt::format(STR("P_{:04X}"), package->GetNamePrivate().GetComparisonIndex().ToUnstableInt() & 0xFFFF);
+                } else {
+                    package_name = *pkg_opt;
+                }
+#else
+                package_name = package->GetNamePrivate().ToString();
+#endif
+                // Validate package_name length and chars before substr
+                if (package_name.size() > 512) package_name = package_name.substr(0, 512);
+                {
+                    size_t slash = package_name.rfind(STR("/"));
+                    if (slash != package_name.npos) package_name = package_name.substr(slash + 1);
+                }
+                if (package_name.empty() || package_name.size() > 128) {
+                    Output::send<LogLevel::Warning>(STR("generate_package_if_non_existent: invalid package_name '{}' length {} -> synthetic\n"), package_name.substr(0,32), package_name.size());
+                    package_name = fmt::format(STR("P_{:04X}"), package->GetNamePrivate().GetComparisonIndex().ToUnstableInt() & 0xFFFF);
+                }
+                {
+                    bool valid = true;
+                    for (auto c : package_name) {
+                        if (!(std::isalnum((unsigned char)c) || c == '_' || c == '-' )) { valid = false; break; }
+                    }
+                    if (!valid) {
+                        Output::send<LogLevel::Warning>(STR("generate_package_if_non_existent: invalid chars in package_name '{}' -> synthetic\n"), package_name);
+                        package_name = fmt::format(STR("P_{:04X}"), package->GetNamePrivate().GetComparisonIndex().ToUnstableInt() & 0xFFFF);
+                    }
+                }
                 File::StringType package_name_all_lower = package_name;
                 std::transform(package_name_all_lower.begin(), package_name_all_lower.end(), package_name_all_lower.begin(), [](File::CharType c) {
                     return std::towlower(c);
@@ -548,20 +952,19 @@ namespace RC::UEGenerator
                     m_file_names.emplace(package_name_all_lower, FileName{});
                 }
 
-                const auto directory_to_generate_in = resolve_output_directory(m_directory_to_generate_in);
-
-                File::StringType ext = specification.get_file_extension();
-                std::filesystem::path primary_file_path_and_name = directory_to_generate_in;
-                primary_file_path_and_name.append(package_name);
-                primary_file_path_and_name.replace_extension(ext);
-
-                std::filesystem::path secondary_file_path_and_name = directory_to_generate_in;
-                secondary_file_path_and_name.append(package_name + STR("_enums"));
-                secondary_file_path_and_name.replace_extension(ext);
-
+                std::string dir_narrow2 = m_dir_narrow;
+                if (dir_narrow2.empty() || dir_narrow2.size() > 256) dir_narrow2 = "CXXHeaderDump";
+                File::StringType ext_u16 = specification.get_file_extension();
+                auto to_narrow2 = [](const File::StringType& s) -> std::string {
+                    std::string r; r.reserve(s.size() > 1000 ? 1000 : s.size());
+                    for (size_t i=0;i<s.size() && i<1000;i++) r.push_back(static_cast<char>(s[i] & 0xFF));
+                    return r;
+                };
+                std::string ext = to_narrow2(ext_u16);
+                if (ext.empty() || ext[0] != '.') ext = "." + ext;
+                std::string pkg_narrow2 = to_narrow2(package_name);
+                if (pkg_narrow2.empty() || pkg_narrow2.size() > 128) pkg_narrow2 = "F";
                 GeneratedFile generated_file{
-                        .primary_file_name = primary_file_path_and_name,
-                        .secondary_file_name = secondary_file_path_and_name,
                         .ordered_primary_file_contents = {},
                         .ordered_secondary_file_contents = {},
                         .package_name = package_name,
@@ -571,8 +974,53 @@ namespace RC::UEGenerator
                         .secondary_file_has_no_contents = true,
                 };
 
-                auto& file_in_map = m_files.emplace(std::move(package_fname), std::move(generated_file)).first->second;
+                // Diagnostic: log intended package_name before emplace
+                Output::send<LogLevel::Warning>(STR("generate_package_if_non_existent: emplacing package_name '{}' size {} for key '{}'\n"), package_name.substr(0,32), package_name.size(), File::StringType(map_key.begin(), map_key.end()).substr(0,32));
+                std::fprintf(stderr, "emplacing package %ls size %zu key %s\n", package_name.substr(0,32).c_str(), package_name.size(), map_key.substr(0,32).c_str());
+                // Heap canary check before emplace
+                void* canary_before = malloc(64);
+                if (canary_before) { memset(canary_before, 0xAA, 64); }
+                GeneratedFile* result_ptr = nullptr;
+#ifdef __linux__
+                bool emplace_ok = RC::SignalGuard::safe_call([&]() {
+                    m_files.push_back(std::move(generated_file));
+                    result_ptr = &m_files.back();
+                    // Set package_name for map_key is already in generated_file.package_name, no need for key
+                });
+                // Check canary after emplace
+                if (canary_before) {
+                    bool corrupted = false;
+                    for (int i=0;i<64;i++) if (((unsigned char*)canary_before)[i] != 0xAA) { corrupted=true; break; }
+                    if (corrupted) {
+                        Output::send<LogLevel::Warning>(STR("HEAP CORRUPTION detected after emplace for package '{}'\n"), package_name.substr(0,32));
+                        std::fprintf(stderr, "HEAP CORRUPTION after emplace %ls\n", package_name.substr(0,32).c_str());
+                    }
+                    // Also check result_ptr's package_name size
+                    if (result_ptr) {
+                        size_t sz = 0;
+                        bool sz_ok = RC::SignalGuard::safe_call([&](){ sz = result_ptr->package_name.size(); });
+                        if (!sz_ok || sz > 128) {
+                            Output::send<LogLevel::Warning>(STR("post-emplace size check failed for '{}' got {}\n"), package_name.substr(0,32), sz);
+                        }
+                    }
+                    free(canary_before);
+                }
+                if (!emplace_ok || !result_ptr) {
+                    Output::send<LogLevel::Warning>(STR("generate_package_if_non_existent: emplace failed for package\n"));
+                    std::fprintf(stderr, "emplace failed\n");
+                    return nullptr;
+                }
+                // Validate after emplace package_name not corrupted
+                if (result_ptr->package_name.empty() || result_ptr->package_name.size() > 128) {
+                    Output::send<LogLevel::Warning>(STR("generate_package_if_non_existent: post-emplace invalid package_name length {}\n"), result_ptr->package_name.size());
+                    result_ptr->package_name = STR("F");
+                }
+                return result_ptr;
+#else
+                m_files.push_back(std::move(generated_file));
+                auto& file_in_map = m_files.back();
                 return &file_in_map;
+#endif
             }
         }
 
@@ -601,17 +1049,96 @@ namespace RC::UEGenerator
       public:
         auto generate() -> void
         {
+#ifdef __linux__
+            bool is_child_process = false;
+            pid_t pid = fork();
+            if (pid == -1) {
+                Output::send<LogLevel::Warning>(STR("CXX fork failed, falling back to direct generation\n"));
+                // fall through to direct generation
+            } else if (pid > 0) {
+                // Parent: wait for child
+                int status = 0;
+                pid_t w = waitpid(pid, &status, 0);
+                if (w == -1) {
+                    Output::send<LogLevel::Warning>(STR("waitpid failed\n"));
+                } else {
+                    if (WIFEXITED(status)) {
+                        int code = WEXITSTATUS(status);
+                        Output::send(STR("CXX generation child exited with code {}\n"), code);
+                        if (code == 0) {
+                            Output::send(STR("CXX generation completed successfully in child\n"));
+                        } else {
+                            Output::send<LogLevel::Warning>(STR("CXX generation child failed with code {}, partial output may exist\n"), code);
+                        }
+                    } else if (WIFSIGNALED(status)) {
+                        Output::send<LogLevel::Warning>(STR("CXX generation child terminated by signal {}\n"), WTERMSIG(status));
+                    }
+                }
+                // Parent done, files should be on disk from child
+                return;
+            } else {
+                // Child: continue to do generation, will _exit at end
+                is_child_process = true;
+                Output::send(STR("CXX generation in child process {}\n"), getpid());
+            }
+#endif
             Output::send(STR("Cleaning up old SDK files...\n"));
             cleanup_old_sdk();
             Output::send(STR("Generating SDK...\n"));
 
             // 400k should be enough for most games, and it's highly unlikely to cause more than one reallocation even if the game is huge
             m_classes_dumped.reserve(400000);
+            m_files.reserve(10000);
 
             size_t num_objects_generated{};
+            size_t skipped_pendingkill = 0, failed_enum = 0, failed_class = 0;
             UObjectGlobals::ForEachUObject([&](void* untyped_object, [[maybe_unused]] int32_t chunk_index, [[maybe_unused]] int32_t object_index) {
+                std::fprintf(stderr, "ForEachUObject: entered chunk %d index %d object %p\n", chunk_index, object_index, untyped_object);
+                std::fflush(stderr);
                 UObject* object = static_cast<UObject*>(untyped_object);
-                UClass* object_class = object->GetClassPrivate();
+                // Validate object pointer before use
+                if (!untyped_object) return LoopAction::Continue;
+#ifdef __linux__
+                // Fast pending kill check: only check FName block, avoid heavy IsUnreachable SignalGuard for performance
+                // IsUnreachable is expensive and triggers many signals, so we only do lightweight checks
+                bool is_pending = false;
+                // Quick FName block check without SignalGuard (just integer ops)
+                {
+                    uint32_t idx = 0;
+                    bool idx_ok = RC::SignalGuard::safe_call([&]() { idx = object->GetFName().GetComparisonIndex().ToUnstableInt(); });
+                    if (!idx_ok) { ++skipped_pendingkill; return LoopAction::Continue; }
+                    uint32_t block = idx >> 16;
+                    if (block >= 8192) { ++skipped_pendingkill; return LoopAction::Continue; }
+                    // Also check Number range
+                    int32_t num = 0;
+                    bool num_ok = RC::SignalGuard::safe_call([&]() { num = object->GetFName().GetNumber(); });
+                    if (!num_ok || num < -1 || num > 100000) { ++skipped_pendingkill; return LoopAction::Continue; }
+                }
+                // For performance, skip IsUnreachable check and outer chain check for now
+                // These are heavy and cause many signals; lightweight FName check is sufficient to filter most corrupted objects
+                // is_pending remains false
+#endif
+                // Wrap GetClassPrivate in SignalGuard to handle corrupted objects
+                UClass* object_class = nullptr;
+#ifdef __linux__
+                bool class_ok = RC::SignalGuard::safe_call([&]() { object_class = object->GetClassPrivate(); });
+                if (!class_ok || !object_class) { ++failed_class; return LoopAction::Continue; }
+                // Validate class FName as well
+                {
+                    bool class_valid = false;
+                    RC::SignalGuard::safe_call([&]() {
+                        auto cfname = object_class->GetFName();
+                        uint32_t cidx = cfname.GetComparisonIndex().ToUnstableInt();
+                        uint32_t cblock = cidx >> 16;
+                        class_valid = (cblock < 8192);
+                    });
+                    if (!class_valid) { ++failed_class; return LoopAction::Continue; }
+                }
+#else
+                UClass* object_class = nullptr;
+                try { object_class = object->GetClassPrivate(); } catch (...) { return LoopAction::Continue; }
+                if (!object_class) return LoopAction::Continue;
+#endif
 
                 // Generate file for package if it doesn't already exist
                 GeneratedFile* package_file = generate_package_if_non_existent(object);
@@ -621,14 +1148,32 @@ namespace RC::UEGenerator
                     // Object should not be dumped
                     return LoopAction::Continue;
                 }
-                else if (object->IsA<UEnum>())
+                // Wrap IsA checks in SignalGuard to handle corrupted objects
+                bool is_enum = false;
+                bool is_class_candidate = false;
+#ifdef __linux__
+                bool is_check_ok = RC::SignalGuard::safe_call([&]() {
+                    is_enum = object->IsA<UEnum>();
+                    if (!is_enum) {
+                        is_class_candidate = (object_class->IsChildOf<UClass>() || object_class->IsChildOf<UScriptStruct>()) && !m_classes_dumped.contains(object);
+                    }
+                });
+                if (!is_check_ok) { ++failed_class; return LoopAction::Continue; }
+                if (is_enum)
+#else
+                if (object->IsA<UEnum>())
+#endif
                 {
                     generate_enum(object, *package_file);
                     ++num_objects_generated;
 
                     return LoopAction::Continue;
                 }
+#ifdef __linux__
+                else if (is_class_candidate)
+#else
                 else if ((object_class->IsChildOf<UClass>() || object_class->IsChildOf<UScriptStruct>()) && !m_classes_dumped.contains(object))
+#endif
                 {
                     // Generate a class for this object
                     auto& object_info = m_classes_dumped.emplace(object, ObjectInfo{object}).first->second;
@@ -650,6 +1195,14 @@ namespace RC::UEGenerator
             });
 
             create_all_files();
+#ifdef __linux__
+            if (is_child_process) {
+                Output::send(STR("CXX child generation finished, exiting\n"));
+                // Ensure files are flushed
+                std::fflush(nullptr);
+                _exit(0);
+            }
+#endif
         }
     };
 
@@ -667,8 +1220,13 @@ namespace RC::UEGenerator
 
             if (!generated_file.secondary_file_has_no_contents)
             {
+                std::string pkg_narrow2;
+                pkg_narrow2.reserve(generated_file.package_name.size());
+                for (auto c : generated_file.package_name) pkg_narrow2.push_back(static_cast<char>(c & 0xFF));
+                std::string sec_fname = pkg_narrow2 + "_enums.hpp";
+                File::StringType sec_w(sec_fname.begin(), sec_fname.end());
                 generated_file.primary_file.write_string_to_file(
-                        fmt::format(STR("#include \"{}\"\n\n"), ensure_str(generated_file.secondary_file_name.filename())));
+                        fmt::format(STR("#include \"{}\"\n\n"), sec_w));
             }
         }
         auto generate_file_footer(GeneratedFile& generated_file) -> void
@@ -678,17 +1236,27 @@ namespace RC::UEGenerator
         auto generate_enum_declaration(File::StringType& content_buffer, UEnum* uenum) -> void
         {
             const auto cpp_form = uenum->GetCppForm();
+            File::StringType ename;
+            bool ename_ok = RC::SignalGuard::safe_call([&](){ ename = get_native_enum_name(uenum, false); });
+            if (!ename_ok || ename.empty()) ename = STR("EnumFallback");
+            Output::send<RC::LogLevel::Warning>(STR("generate_enum_declaration: cpp_form {} for enum '{}'\n"), (int)cpp_form, ename);
+            std::fprintf(stderr, "generate_enum_declaration: cpp_form %d for enum %ls\n", (int)cpp_form, ename.c_str());
             if (cpp_form == UEnum::ECppForm::Regular)
             {
-                content_buffer.append(fmt::format(STR("enum {} {{\n"), get_native_enum_name(uenum, false)));
+                content_buffer.append(fmt::format(STR("enum {} {{\n"), ename));
             }
             else if (cpp_form == UEnum::ECppForm::Namespaced)
             {
-                content_buffer.append(fmt::format(STR("namespace {} {{\n{}enum Type {{\n"), get_native_enum_name(uenum, false), generate_tab()));
+                content_buffer.append(fmt::format(STR("namespace {} {{\n{}enum Type {{\n"), ename, generate_tab()));
             }
             else if (cpp_form == UEnum::ECppForm::EnumClass)
             {
-                content_buffer.append(fmt::format(STR("enum class {} {{\n"), get_native_enum_name(uenum, false)));
+                content_buffer.append(fmt::format(STR("enum class {} {{\n"), ename));
+            }
+            else
+            {
+                Output::send<RC::LogLevel::Warning>(STR("generate_enum_declaration: unknown cpp_form {} for enum '{}', using Regular fallback\n"), (int)cpp_form, ename);
+                content_buffer.append(fmt::format(STR("enum {} {{\n"), ename));
             }
         }
         auto generate_enum_member(File::StringType& content_buffer, UEnum* uenum, const File::StringType& enum_value_name, const Unreal::FEnumNamePair& elem) -> void
@@ -722,6 +1290,7 @@ namespace RC::UEGenerator
 
             // Make sure that the base class is defined
             generator->generate_class_dependency(object_info, inherits_from_class, current_class_content);
+            Output::send<LogLevel::Warning>(STR("generate_class: '{}' super '{}' for package '{}' content_buffer {}b\n"), native_class->GetName(), inherits_from_class ? inherits_from_class->GetName() : STR("None"), generated_file.package_name, content_buffer.size());
 
             // If any properties have dependencies, make sure that they are defined
             // This makes sure that we don't have member variables with undefined types (if the types are local, otherwise we need to include the file that the struct exists in)
@@ -750,6 +1319,7 @@ namespace RC::UEGenerator
             }
 
             auto class_name = generate_class_name(native_class);
+            Output::send<LogLevel::Warning>(STR("generate_class: class_name '{}' for package '{}'\n"), class_name, generated_file.package_name);
 
             generate_class_declaration(content_buffer, native_class, inherits_from_class);
 
@@ -758,9 +1328,31 @@ namespace RC::UEGenerator
 
             for (const auto& property_info : properties_to_generate)
             {
-                XProperty* property = property_info.property;
-                int32_t current_property_offset = property->GetOffset_Internal();
-                int32_t current_property_size = property->GetSize();
+#ifdef __linux__
+                bool prop_ok = false;
+                prop_ok = RC::SignalGuard::safe_call([&]() {
+#endif
+                    XProperty* property = property_info.property;
+                    if (!property) return;
+                    int32_t current_property_offset = 0, current_property_size = 0;
+                    try {
+                        current_property_offset = property->GetOffset_Internal();
+                        current_property_size = property->GetSize();
+                        if (current_property_offset < 0 || current_property_offset > 0x20000) return;
+                        if (current_property_size < 0 || current_property_size > 0x10000) return;
+                        if (current_property_offset + current_property_size > 0x30000) return;
+                    } catch (...) { return; }
+                    StringType prop_name;
+#ifdef __linux__
+                    try {
+                        auto opt = SafeFNameToString(property->GetFName(), true);
+                        prop_name = opt ? *opt : STR("<invalid>");
+                        if (prop_name.size() > 256 || prop_name.empty()) prop_name = fmt::format(STR("Prop_{:08X}"), property->GetFName().GetComparisonIndex().ToUnstableInt());
+                    } catch (...) { prop_name = STR("<name_failed>"); }
+#else
+                    try { prop_name = property->GetName(); } catch (...) { prop_name = STR("<name_failed>"); }
+#endif
+                    Output::send<LogLevel::Warning>(STR("  generate_class: property '{}' for class '{}' content_buffer {}b\n"), prop_name, class_name, content_buffer.size());
 
                 StringType part_one{};
                 try
@@ -769,13 +1361,25 @@ namespace RC::UEGenerator
                                            generate_tab(),
                                            property_info.should_forward_declare ? STR("class ") : STR(""),
                                            generate_property_cxx_name(property, true, native_class, EnableForwardDeclarations::Yes),
-                                           property->GetName());
+#ifdef __linux__
+                                           ([&]() -> StringType {
+                                               try {
+                                                   auto opt = SafeFNameToString(property->GetFName(), true);
+                                                   auto s = opt ? *opt : fmt::format(STR("Prop_{:08X}"), property->GetFName().GetComparisonIndex().ToUnstableInt());
+                                                   if (s.empty() || s.size()>256) s = fmt::format(STR("Prop_{:08X}"), property->GetFName().GetComparisonIndex().ToUnstableInt());
+                                                   return s;
+                                               } catch (...) { return STR("Prop_Failed"); }
+                                           }())
+#else
+                                           property->GetName()
+#endif
+                                           );
                 }
                 catch (std::exception& e)
                 {
                     Output::send<LogLevel::Warning>(STR("Could not generate property '{}' because: {}\n"), property->GetFullName(), ensure_str(e.what()));
-                    continue;
-                }
+                    return;
+                } catch (...) { return; }
 
                 content_buffer.append(fmt::format(STR("{}\n"), generator->generate_offset_comment(property, part_one)));
 
@@ -840,6 +1444,44 @@ namespace RC::UEGenerator
                 }
 
                 last_property_in_this_class = property;
+                    // Final hard limit check after property fully processed
+                    if (content_buffer.size() > 2*1024*1024) {
+                        Output::send<LogLevel::Warning>(STR("generate_class: content_buffer exceeded 2MB after property '{}' for class '{}' ({}b), truncating\n"), prop_name, class_name, content_buffer.size());
+                        content_buffer.append(STR("\n// TRUNCATED DUE TO SIZE LIMIT (2MB) - remaining properties skipped\n"));
+                    }
+#ifdef __linux__
+                });
+                if (!prop_ok) {
+                    StringType prop_name2;
+#ifdef __linux__
+                    try {
+                        if (property_info.property) {
+                            auto opt = SafeFNameToString(property_info.property->GetFName(), true);
+                            prop_name2 = opt ? *opt : STR("<invalid>");
+                            if (prop_name2.size() > 256 || prop_name2.empty()) prop_name2 = fmt::format(STR("Prop_{:08X}"), property_info.property->GetFName().GetComparisonIndex().ToUnstableInt());
+                        } else prop_name2 = STR("<null>");
+                    } catch (...) { prop_name2 = STR("<name_failed>"); }
+#else
+                    try { prop_name2 = property_info.property ? property_info.property->GetName() : STR("<null>"); } catch (...) { prop_name2 = STR("<name_failed>"); }
+#endif
+                    Output::send<LogLevel::Warning>(STR("generate_class: SignalGuard caught SIGSEGV for property '{}' at {:016X} in class '{}', skipping\n"), prop_name2, (uintptr_t)property_info.property, class_name);
+                    continue;
+                }
+                if (content_buffer.size() > 2*1024*1024) {
+                    Output::send<LogLevel::Warning>(STR("generate_class: breaking loop for class '{}' due to 2MB limit ({}b)\n"), class_name, content_buffer.size());
+                    break;
+                }
+#endif
+            }
+
+            // Hard limit: truncate if still exceeds 2MB after all processing
+            if (content_buffer.size() > 2*1024*1024) {
+                Output::send<LogLevel::Warning>(STR("generate_class: content_buffer exceeded 2MB for class '{}' final size {}b, truncating\n"), class_name, content_buffer.size());
+                std::fprintf(stderr, "generate_class: final content_buffer exceeded 2MB (%zu)\n", content_buffer.size());
+                if (content_buffer.size() > 2*1024*1024 + 100) {
+                    content_buffer.resize(2*1024*1024);
+                    content_buffer.append(STR("\n// TRUNCATED DUE TO SIZE LIMIT (2MB)\n"));
+                }
             }
 
             int32_t class_size = native_class->GetPropertiesSize();

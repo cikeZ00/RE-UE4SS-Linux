@@ -1,5 +1,6 @@
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <SDKGenerator/Common.hpp>
+#include <SignalGuard.hpp>
 #pragma warning(disable : 4005)
 #include <Unreal/AActor.hpp>
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
@@ -23,25 +24,32 @@ namespace RC::UEGenerator
     auto get_native_class_name(UClass* uclass, bool interface_name) -> File::StringType
     {
         File::StringType result_string;
-
-        if (interface_name)
-        {
-            result_string.append(STR("I"));
+        if (interface_name) result_string.append(STR("I"));
+        else if (uclass->IsChildOf<AActor>()) result_string.append(STR("A"));
+        else result_string.append(STR("U"));
+        if ((uclass->GetClassFlags() & Unreal::CLASS_Deprecated) != 0) result_string.append(STR("DEPRECATED_"));
+        StringType raw_name;
+        try { raw_name = uclass->GetName(); } catch (...) { raw_name = STR("Class_Fallback"); }
+        if (raw_name.empty() || raw_name.size() > 256) {
+            try {
+                auto fname = uclass->GetNamePrivate();
+                uint32_t idx = fname.GetComparisonIndex().ToUnstableInt();
+                uint32_t block = idx >> 16;
+                if (block >= 8192) raw_name = fmt::format(STR("Class_{:08X}"), idx);
+                else raw_name = fname.ToString();
+                if (raw_name.empty() || raw_name.size() > 256) raw_name = fmt::format(STR("Class_{:08X}"), idx);
+            } catch (...) { raw_name = STR("Class_Fallback"); }
         }
-        else if (uclass->IsChildOf<AActor>())
-        {
-            result_string.append(STR("A"));
+        bool valid = true;
+        for (auto c : raw_name) { if (!(std::isalnum((unsigned char)c) || c == '_' )) { valid = false; break; } }
+        if (!valid) {
+            try {
+                auto fname = uclass->GetNamePrivate();
+                uint32_t idx = fname.GetComparisonIndex().ToUnstableInt();
+                raw_name = fmt::format(STR("Class_{:08X}"), idx);
+            } catch (...) { raw_name = STR("Class_Fallback"); }
         }
-        else
-        {
-            result_string.append(STR("U"));
-        }
-        if ((uclass->GetClassFlags() & Unreal::CLASS_Deprecated) != 0)
-        {
-            result_string.append(STR("DEPRECATED_"));
-        }
-
-        result_string.append(uclass->GetName());
+        result_string.append(raw_name);
         return result_string;
     }
 
@@ -60,11 +68,28 @@ namespace RC::UEGenerator
     auto get_native_enum_name(UEnum* uenum, bool include_type) -> File::StringType
     {
         StringType result_string;
-
-        // Seems to be not needed, because enum objects, unlike classes or structs, retain their normal E prefix
-        // ResultString.append(STR("E"));
-        result_string.append(uenum->GetName());
-
+        StringType raw_name;
+        try { raw_name = uenum->GetName(); } catch (...) { raw_name = STR("Enum_Fallback"); }
+        if (raw_name.empty() || raw_name.size() > 256) {
+            try {
+                auto fname = uenum->GetNamePrivate();
+                uint32_t idx = fname.GetComparisonIndex().ToUnstableInt();
+                uint32_t block = idx >> 16;
+                if (block >= 8192) raw_name = fmt::format(STR("Enum_{:08X}"), idx);
+                else raw_name = fname.ToString();
+                if (raw_name.empty() || raw_name.size() > 256) raw_name = fmt::format(STR("Enum_{:08X}"), idx);
+            } catch (...) { raw_name = STR("Enum_Fallback"); }
+        }
+        bool valid = true;
+        for (auto c : raw_name) { if (!(std::isalnum((unsigned char)c) || c == '_' )) { valid = false; break; } }
+        if (!valid) {
+            try {
+                auto fname = uenum->GetNamePrivate();
+                uint32_t idx = fname.GetComparisonIndex().ToUnstableInt();
+                raw_name = fmt::format(STR("Enum_{:08X}"), idx);
+            } catch (...) { raw_name = STR("Enum_Fallback"); }
+        }
+        result_string.append(raw_name);
         // Namespaced enums need to have ::Type appended for the type
         if (uenum->GetCppForm() == UEnum::ECppForm::Namespaced && include_type)
         {
@@ -76,10 +101,29 @@ namespace RC::UEGenerator
     auto get_native_struct_name(UScriptStruct* script_struct) -> File::StringType
     {
         StringType result_string;
-
         result_string.append(STR("F"));
-        result_string.append(script_struct->GetName());
-
+        StringType raw_name;
+        try { raw_name = script_struct->GetName(); } catch (...) { raw_name = STR("Struct_Fallback"); }
+        if (raw_name.empty() || raw_name.size() > 256) {
+            try {
+                auto fname = script_struct->GetNamePrivate();
+                uint32_t idx = fname.GetComparisonIndex().ToUnstableInt();
+                uint32_t block = idx >> 16;
+                if (block >= 8192) raw_name = fmt::format(STR("Struct_{:08X}"), idx);
+                else raw_name = fname.ToString();
+                if (raw_name.empty() || raw_name.size() > 256) raw_name = fmt::format(STR("Struct_{:08X}"), idx);
+            } catch (...) { raw_name = STR("Struct_Fallback"); }
+        }
+        bool valid = true;
+        for (auto c : raw_name) { if (!(std::isalnum((unsigned char)c) || c == '_' )) { valid = false; break; } }
+        if (!valid) {
+            try {
+                auto fname = script_struct->GetNamePrivate();
+                uint32_t idx = fname.GetComparisonIndex().ToUnstableInt();
+                raw_name = fmt::format(STR("Struct_{:08X}"), idx);
+            } catch (...) { raw_name = STR("Struct_Fallback"); }
+        }
+        result_string.append(raw_name);
         return result_string;
     }
 
@@ -117,7 +161,22 @@ namespace RC::UEGenerator
                                     UObject* class_context,
                                     EnableForwardDeclarations enable_forward_declarations) -> File::StringType
     {
-        const StringType field_class_name = property->GetClass().GetName();
+        StringType field_class_name;
+        try {
+            StringType tmp;
+            bool tmp_ok = false;
+#ifdef __linux__
+            tmp_ok = RC::SignalGuard::safe_call([&](){ tmp = property->GetClass().GetName(); });
+#else
+            try { tmp = property->GetClass().GetName(); tmp_ok = true; } catch (...) {}
+#endif
+            if (!tmp_ok || tmp.empty() || tmp.size() > 128) tmp = STR("UnknownClass");
+            else {
+                bool valid=true; for(auto c:tmp) if(!(std::isalnum((unsigned char)c)||c=='_')){valid=false;break;}
+                if(!valid) tmp = STR("UnknownClass");
+            }
+            field_class_name = tmp;
+        } catch (...) { field_class_name = STR("UnknownClass"); }
 
         // Byte Property
         if (property->IsA<FByteProperty>())
