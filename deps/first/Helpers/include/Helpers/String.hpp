@@ -5,6 +5,7 @@
 #include <cwctype>
 #include <locale>
 #include <shared_mutex>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>

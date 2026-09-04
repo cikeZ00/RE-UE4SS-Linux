@@ -92,8 +92,15 @@ local CLANG_COMPILE_OPTIONS = {
         "-fcolor-diagnostics",
         "-Wno-unknown-pragmas",
         "-Wno-unused-parameter",
-        "-fms-extensions",
-        "-Wignored-attributes"
+        "-Wno-ignored-attributes",
+        "-Wno-unknown-attributes",
+        "-Wno-switch",
+        "-Wno-null-conversion",
+        "-Wno-undefined-inline",
+        "-Wno-deprecated-declarations",
+        "-Wno-deprecated-enum-enum-conversion",
+        "-Wno-format",
+        "-fms-extensions"
     },
     ["ldflags"] = {
         "-g"
